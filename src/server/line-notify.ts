@@ -2,6 +2,7 @@
 // กฎ: ห้ามทำให้เกมพัง — fire-and-forget, ไม่ throw, log แล้วข้ามเมื่อ env ไม่ครบ / dev user / remaining 0 / API error
 // อ่าน process.env.* ภายในฟังก์ชันเท่านั้น (ห้ามอ่านที่ top-level ของโมดูล)
 // ห้าม log token ใด ๆ (LIFF access token, channel token, notification token) และ channel secret
+import { kv } from './kv';
 import type { AuthedUser } from './types';
 
 const CHANNEL_TOKEN_URL = 'https://api.line.me/oauth2/v3/token';
@@ -10,15 +11,33 @@ const NOTIFIER_SEND_URL = 'https://api.line.me/message/v3/notifier/send?target=s
 const FETCH_TIMEOUT_MS = 5000;
 const CHANNEL_TOKEN_REFRESH_MARGIN_MS = 60_000; // ขอ stateless token ใหม่ก่อนหมดอายุ 60s
 
-// ---- module state (in-memory — หายเมื่อ server restart) ----
+// ---- module state (in-memory ต่อ instance — หายเมื่อ server restart) ----
 /** stateless channel access token (อายุ 15 นาที, ออกใหม่ได้ไม่จำกัด) */
 let channelToken: { token: string; expiresAt: number } | null = null;
 /** กันยิงขอ channel token ซ้อนกันตอนจบเกม (ส่งหลายคนพร้อมกัน) */
 let channelTokenInflight: Promise<string> | null = null;
-/** notification token ต่อ userId — expiresAt = epoch ms ตาม expiresIn ที่ LINE ตอบ */
-const notifyTokens = new Map<string, { token: string; remaining: number; expiresAt: number }>();
 /** กันขอ notification token ซ้ำด้วย LIFF token เดิมในเวลาใกล้กัน (LINE ตอบ 400) */
 const notifyInflight = new Map<string, Promise<void>>();
+
+// ---- notification token ต่อ userId (kv — instance ที่ส่งผลอาจไม่ใช่ instance ที่ผู้เล่น join) ----
+/** expiresAt = epoch ms ตาม expiresIn ที่ LINE ตอบ (Infinity = LINE ไม่บอก) */
+interface NotifyEntry { token: string; remaining: number; expiresAt: number }
+const NOTIFY_MAX_TTL_SEC = 30 * 24 * 60 * 60;
+const notifyKey = (userId: string) => `notify:${userId}`;
+
+async function loadNotifyToken(userId: string): Promise<NotifyEntry | null> {
+  const raw = await kv().get(notifyKey(userId));
+  if (!raw) return null;
+  const entry = JSON.parse(raw) as Omit<NotifyEntry, 'expiresAt'> & { expiresAt: number | null };
+  return { ...entry, expiresAt: entry.expiresAt ?? Number.POSITIVE_INFINITY };
+}
+
+async function saveNotifyToken(userId: string, entry: NotifyEntry): Promise<void> {
+  const finite = Number.isFinite(entry.expiresAt);
+  const ttlSec = finite ? Math.min(NOTIFY_MAX_TTL_SEC, Math.ceil((entry.expiresAt - Date.now()) / 1000)) : NOTIFY_MAX_TTL_SEC;
+  if (ttlSec <= 0) return;
+  await kv().set(notifyKey(userId), JSON.stringify({ ...entry, expiresAt: finite ? entry.expiresAt : null }), ttlSec);
+}
 
 class LineApiError extends Error {
   constructor(
@@ -115,12 +134,13 @@ async function requestNotificationToken(userId: string, liffAccessToken: string)
     const token = body.notificationToken;
     if (typeof token !== 'string' || !token) throw new Error('notifier/token response ไม่มี notificationToken');
     const remaining = Number(body.remainingCount);
-    notifyTokens.set(userId, {
+    const entry: NotifyEntry = {
       token,
       remaining: Number.isFinite(remaining) ? remaining : 0,
       expiresAt: expiresAtFrom(body.expiresIn, Number.POSITIVE_INFINITY),
-    });
-    console.log('[line-notify] token ok', userId, `remaining=${notifyTokens.get(userId)?.remaining}`);
+    };
+    await saveNotifyToken(userId, entry);
+    console.log('[line-notify] token ok', userId, `remaining=${entry.remaining}`);
   } catch (err) {
     if (err instanceof LineApiError && err.status === 401) channelToken = null; // channel token ใช้ไม่ได้ → ขอใหม่รอบหน้า
     console.warn('[line-notify] token skip', userId, describe(err));
@@ -142,7 +162,7 @@ export async function ensureNotificationToken(user: AuthedUser): Promise<void> {
       console.log('[line-notify] token skip', user.userId, '(ไม่มี LIFF access token)');
       return;
     }
-    const cached = notifyTokens.get(user.userId);
+    const cached = await loadNotifyToken(user.userId);
     // มี token ที่ยังใช้ได้อยู่แล้ว → ไม่ขอซ้ำ (ขอถี่ ๆ ด้วย LIFF token เดิมจะได้ 400)
     if (cached && cached.remaining > 0 && cached.expiresAt > Date.now()) return;
 
@@ -193,7 +213,7 @@ export async function sendResultMessage(user: Pick<AuthedUser, 'userId' | 'isDev
       console.log('[line-notify] send skip', userId, '(env LINE_CHANNEL_ID/LINE_CHANNEL_SECRET/LINE_SERVICE_TEMPLATE ไม่ครบ)');
       return;
     }
-    const entry = notifyTokens.get(userId);
+    const entry = await loadNotifyToken(userId);
     if (!entry) {
       console.log('[line-notify] send skip', userId, '(ไม่มี notification token)');
       return;
@@ -203,7 +223,7 @@ export async function sendResultMessage(user: Pick<AuthedUser, 'userId' | 'isDev
       return;
     }
     if (entry.expiresAt <= Date.now()) {
-      notifyTokens.delete(userId);
+      await kv().del(notifyKey(userId));
       console.log('[line-notify] send skip', userId, '(notification token หมดอายุ)');
       return;
     }
@@ -223,12 +243,13 @@ export async function sendResultMessage(user: Pick<AuthedUser, 'userId' | 'isDev
     // LINE ตอบ notificationToken ตัวใหม่ + remainingCount ทุกครั้ง → เก็บทับเสมอ
     const nextToken = typeof body.notificationToken === 'string' && body.notificationToken ? body.notificationToken : entry.token;
     const remaining = Number(body.remainingCount);
-    notifyTokens.set(userId, {
+    const next: NotifyEntry = {
       token: nextToken,
       remaining: Number.isFinite(remaining) ? remaining : Math.max(0, entry.remaining - 1),
       expiresAt: expiresAtFrom(body.expiresIn, entry.expiresAt),
-    });
-    console.log('[line-notify] sent', userId, `remaining=${notifyTokens.get(userId)?.remaining}`);
+    };
+    await saveNotifyToken(userId, next);
+    console.log('[line-notify] sent', userId, `remaining=${next.remaining}`);
   } catch (err) {
     if (err instanceof LineApiError && err.status === 401) channelToken = null;
     console.warn('[line-notify] send failed', userId, describe(err));

@@ -6,7 +6,14 @@ export interface SocketData { user: AuthedUser; roomCode?: string }
 export type TypedServer = Server<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>;
 export type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>;
 
-export interface Player { userId: string; name: string; pictureUrl?: string; socketId: string | null; isDev: boolean }
+export interface Player {
+  userId: string;
+  name: string;
+  pictureUrl?: string;
+  socketId: string | null;
+  isDev: boolean;
+  offlineAt?: number; // socket หลุดเอง (epoch ms) — ยังนับว่า online จนพ้น OFFLINE_GRACE_MS เผื่อต่อกลับมา
+}
 export interface Round {
   location: string;
   spyId: string;
@@ -23,5 +30,4 @@ export interface Room {
   players: Map<string, Player>; // key = userId, insertion order = ลำดับเข้าห้อง
   settings: { discussionSec: number; voteSec: number };
   round?: Round;
-  timer?: NodeJS.Timeout;
 }

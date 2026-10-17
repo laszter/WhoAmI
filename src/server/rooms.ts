@@ -1,5 +1,6 @@
-// In-memory room store — state อยู่ใน process ของ server.ts เท่านั้น (ห้ามอ่าน/แก้จาก Route Handler)
+// Room store — state ห้องอยู่ใน kv (Redis บน Vercel ที่มีหลาย instance / memory ตอน dev) ไม่ใช่ตัวแปรใน process
 // ผู้เล่นผูกกับ userId (key ของ room.players) ไม่ใช่ socketId; disconnect = socketId null แต่ยังอยู่ในห้อง
+// แก้ห้องผ่าน lockRoom (lock + โหลด) → ฟังก์ชัน pure ด้านล่าง → saveRoom เท่านั้น (handlers.ts withRoom)
 // อ่าน process.env.* ภายในฟังก์ชันเท่านั้น (server.ts โหลด .env.local หลัง import ถูก hoist)
 import { randomInt } from 'node:crypto';
 import {
@@ -9,19 +10,81 @@ import {
   type PublicPlayer,
   type PublicRoomState,
 } from '../shared/types';
-import { clampSec, clearTimer } from './game';
-import type { AuthedUser, Player, Room } from './types';
+import { clampSec } from './game';
+import { kv } from './kv';
+import type { AuthedUser, Player, Room, Round } from './types';
 
-export const rooms = new Map<string, Room>();
+const ROOM_TTL_SEC = 12 * 60 * 60;      // ห้องที่ไม่มีใครแตะเกินนี้หายเอง
+const USER_ROOM_TTL_SEC = 24 * 60 * 60;
+/** socket หลุดเอง (เน็ตสะดุด / Vercel ตัด connection ทุก ~5 นาที) → รอเท่านี้ก่อนนับว่า offline */
+export const OFFLINE_GRACE_MS = 5_000;
 
-/** 4 ตัวจาก ROOM_CODE_ALPHABET และไม่ซ้ำกับห้องที่มีอยู่ */
-export function generateCode(): string {
-  for (let attempt = 0; attempt < 10_000; attempt++) {
-    let code = '';
-    for (let i = 0; i < ROOM_CODE_LENGTH; i++) code += ROOM_CODE_ALPHABET[randomInt(ROOM_CODE_ALPHABET.length)];
-    if (!rooms.has(code)) return code;
-  }
-  throw new Error('สร้างโค้ดห้องไม่สำเร็จ (ห้องเต็มระบบ)');
+const roomKey = (code: string) => `room:${code}`;
+const userRoomKey = (userId: string) => `user-room:${userId}`;
+
+// ---- persistence ----
+
+interface StoredRound extends Omit<Round, 'roles' | 'votes'> {
+  roles: [string, string][];
+  votes: [string, string][];
+}
+interface StoredRoom extends Omit<Room, 'players' | 'round'> {
+  players: Player[]; // ลำดับเข้าห้อง
+  round?: StoredRound;
+}
+
+function serialize(room: Room): string {
+  const { players, round, ...rest } = room;
+  const stored: StoredRoom = {
+    ...rest,
+    players: [...players.values()],
+    ...(round ? { round: { ...round, roles: [...round.roles], votes: [...round.votes] } } : {}),
+  };
+  return JSON.stringify(stored);
+}
+
+function deserialize(raw: string): Room {
+  const { players, round, ...rest } = JSON.parse(raw) as StoredRoom;
+  return {
+    ...rest,
+    players: new Map(players.map((p) => [p.userId, p])),
+    ...(round ? { round: { ...round, roles: new Map(round.roles), votes: new Map(round.votes) } } : {}),
+  };
+}
+
+/** รัน fn แบบ exclusive ต่อห้อง (ข้าม instance) พร้อมห้องที่โหลดหลังได้ lock (null = ไม่มีห้องนี้) — ห้ามเรียกซ้อนกันข้างใน */
+export function lockRoom<T>(code: string, fn: (room: Room | null) => Promise<T>): Promise<T> {
+  return kv().withLock(roomKey(code), (raw) => fn(raw ? deserialize(raw) : null));
+}
+
+export async function saveRoom(room: Room): Promise<void> {
+  await kv().set(roomKey(room.code), serialize(room), ROOM_TTL_SEC);
+}
+
+export async function deleteRoom(code: string): Promise<void> {
+  await kv().del(roomKey(code));
+}
+
+/** ห้องปัจจุบันของ user (ผู้เล่น 1 คนอยู่ได้ 1 ห้อง) — ใช้หาห้องเก่าที่ต้องถอด user ออกตอนเข้า/สร้างห้องใหม่ */
+export async function getUserRoom(userId: string): Promise<string | null> {
+  return kv().get(userRoomKey(userId));
+}
+
+/** ตั้งห้องปัจจุบันของ user แล้วคืนห้องก่อนหน้า */
+export async function swapUserRoom(userId: string, code: string): Promise<string | null> {
+  return kv().swap(userRoomKey(userId), code, USER_ROOM_TTL_SEC);
+}
+
+export async function clearUserRoom(userId: string): Promise<void> {
+  await kv().del(userRoomKey(userId));
+}
+
+// ---- create / join / leave ----
+
+function randomCode(): string {
+  let code = '';
+  for (let i = 0; i < ROOM_CODE_LENGTH; i++) code += ROOM_CODE_ALPHABET[randomInt(ROOM_CODE_ALPHABET.length)];
+  return code;
 }
 
 /** ค่าเริ่มต้นของห้องใหม่: env DISCUSSION_SEC / VOTE_SEC (อ่านแบบ lazy) หรือ LIMITS.DEFAULT_* */
@@ -42,48 +105,45 @@ function toPlayer(user: AuthedUser, socketId: string): Player {
   };
 }
 
-export function createRoom(host: AuthedUser, socketId: string): Room {
-  const room: Room = {
-    code: generateCode(),
-    hostId: host.userId,
-    phase: 'lobby',
-    players: new Map([[host.userId, toPlayer(host, socketId)]]),
-    settings: defaultSettings(),
-  };
-  rooms.set(room.code, room);
-  return room;
+/** สร้างห้องใหม่ด้วยโค้ดที่ไม่ซ้ำ (จองโค้ดด้วย setNx) แล้วบันทึกลง store */
+export async function createRoom(host: AuthedUser, socketId: string): Promise<Room> {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const room: Room = {
+      code: randomCode(),
+      hostId: host.userId,
+      phase: 'lobby',
+      players: new Map([[host.userId, toPlayer(host, socketId)]]),
+      settings: defaultSettings(),
+    };
+    if (await kv().setNx(roomKey(room.code), serialize(room), ROOM_TTL_SEC)) return room;
+  }
+  throw new Error('สร้างโค้ดห้องไม่สำเร็จ (ห้องเต็มระบบ)');
 }
 
-export function joinRoom(
-  code: string,
-  user: AuthedUser,
-  socketId: string,
-): { room: Room; reconnected: boolean } | { error: string } {
-  const room = rooms.get(code);
-  if (!room) return { error: 'ไม่พบห้องนี้' };
-
+export function joinRoom(room: Room, user: AuthedUser, socketId: string): { reconnected: boolean } | { error: string } {
   const existing = room.players.get(user.userId);
   if (existing) {
     // reconnect (ได้ทุก phase) — อัปเดต socket ใหม่ + โปรไฟล์ล่าสุด
     existing.socketId = socketId;
+    delete existing.offlineAt;
     existing.name = user.name;
     if (user.pictureUrl) existing.pictureUrl = user.pictureUrl;
     else delete existing.pictureUrl;
     existing.isDev = user.isDev;
-    return { room, reconnected: true };
+    return { reconnected: true };
   }
 
   if (room.phase !== 'lobby') return { error: 'เกมเริ่มแล้ว รอรอบหน้า' };
   if (room.players.size >= LIMITS.MAX_PLAYERS) return { error: 'ห้องเต็ม' };
 
   room.players.set(user.userId, toPlayer(user, socketId));
-  return { room, reconnected: false };
+  return { reconnected: false };
 }
 
 /**
  * lobby/result → ลบออกจากห้อง (host ออก → โอนให้คนแรกที่ online, ถ้าไม่มีใคร online ให้คนแรกที่เหลือ)
  * ระหว่างเกม (discussion/voting/spyGuess) → แค่ offline เพื่อไม่ให้ roles/votes พัง
- * ห้องว่าง → clearTimer + ลบห้อง
+ * ห้องว่าง (players.size === 0) → caller ลบห้องออกจาก store
  */
 export function leaveRoom(room: Room, userId: string): void {
   const player = room.players.get(userId);
@@ -98,30 +158,21 @@ export function leaveRoom(room: Room, userId: string): void {
     }
   } else {
     player.socketId = null;
-  }
-
-  if (room.players.size === 0) {
-    clearTimer(room);
-    rooms.delete(room.code);
+    delete player.offlineAt;
   }
 }
 
 /**
- * ผู้เล่น 1 คนอยู่ได้ 1 ห้อง: เอา userId ออกจากทุกห้องยกเว้น exceptCode ด้วยกติกาเดียวกับ leaveRoom
- * (lobby/result = ลบ + โอน host · ระหว่างเกม = แค่ offline) → คืนห้องที่ยังอยู่และมีการเปลี่ยนแปลง (ไว้ broadcast)
+ * ผู้เล่น 1 คนอยู่ได้ 1 ห้อง: เอา userId ออกจากห้องเก่าด้วยกติกาเดียวกับ leaveRoom
+ * (lobby/result = ลบ + โอน host · ระหว่างเกม = แค่ offline) → คืน true ถ้าห้องเปลี่ยน (ไว้ broadcast)
  */
-export function detachFromOtherRooms(userId: string, exceptCode: string): Room[] {
-  const changed: Room[] = [];
-  for (const room of [...rooms.values()]) {
-    if (room.code === exceptCode) continue;
-    const player = room.players.get(userId);
-    if (!player) continue;
-    const inGame = room.phase !== 'lobby' && room.phase !== 'result';
-    if (inGame && player.socketId === null) continue; // offline อยู่แล้ว ไม่มีอะไรเปลี่ยน
-    leaveRoom(room, userId);
-    if (rooms.has(room.code)) changed.push(room);
-  }
-  return changed;
+export function detachFromRoom(room: Room, userId: string): boolean {
+  const player = room.players.get(userId);
+  if (!player) return false;
+  const inGame = room.phase !== 'lobby' && room.phase !== 'result';
+  if (inGame && player.socketId === null) return false; // offline อยู่แล้ว ไม่มีอะไรเปลี่ยน
+  leaveRoom(room, userId);
+  return true;
 }
 
 /**
@@ -138,11 +189,47 @@ export function ensureOnlineHost(room: Room): boolean {
   return true;
 }
 
-/** socket หลุด → player ที่ผูกกับ socket นี้กลายเป็น offline (ถ้า reconnect ด้วย socket ใหม่ไปแล้วจะไม่กระทบ) */
-export function markOffline(room: Room, socketId: string): void {
+/**
+ * socket หลุด → player ที่ผูกกับ socket นี้ (ถ้า reconnect ด้วย socket ใหม่ไปแล้วจะไม่กระทบ)
+ * graceful (หลุดเอง) → จดเวลาไว้ ยัง online จนพ้น OFFLINE_GRACE_MS (expireOffline) · ไม่งั้น offline ทันที
+ * คืน true ถ้า online/offline ที่คนอื่นเห็นเปลี่ยน
+ */
+export function markOffline(room: Room, socketId: string, graceful: boolean, now = Date.now()): boolean {
+  let changed = false;
   for (const player of room.players.values()) {
-    if (player.socketId === socketId) player.socketId = null;
+    if (player.socketId !== socketId) continue;
+    if (graceful) {
+      player.offlineAt ??= now;
+    } else {
+      player.socketId = null;
+      delete player.offlineAt;
+      changed = true;
+    }
   }
+  return changed;
+}
+
+/** หลุดเกิน OFFLINE_GRACE_MS แล้วไม่กลับมา → offline จริง · คืน true ถ้ามีคนเปลี่ยน */
+export function expireOffline(room: Room, now = Date.now()): boolean {
+  let changed = false;
+  for (const player of room.players.values()) {
+    if (player.offlineAt === undefined || now < player.offlineAt + OFFLINE_GRACE_MS) continue;
+    player.socketId = null;
+    delete player.offlineAt;
+    changed = true;
+  }
+  return changed;
+}
+
+/** เวลาที่เร็วที่สุดที่ผู้เล่นที่หลุดอยู่จะพ้นช่วงผ่อนผัน (null = ไม่มี) */
+export function offlineDeadline(room: Room): number | null {
+  let at: number | null = null;
+  for (const player of room.players.values()) {
+    if (player.offlineAt === undefined) continue;
+    const due = player.offlineAt + OFFLINE_GRACE_MS;
+    if (at === null || due < at) at = due;
+  }
+  return at;
 }
 
 /**

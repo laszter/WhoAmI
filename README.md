@@ -1,7 +1,7 @@
 # Spy Party — เกมจับสายลับบน LINE MINI App
 
 เกมแนว Spyfall สำหรับ 3–8 คน ระบบสุ่มสถานที่ 1 แห่งและ Spy 1 คน ทุกคนผลัดกันถามตอบจนหมดเวลา → โหวต → เฉลย → ส่งผลแพ้/ชนะให้แต่ละคนทาง LINE Service Message
-Stack: Next.js 16 + Socket.IO ใน process เดียว (`server.ts`) ไม่มี database · อ่านเพิ่ม: [DESIGN.md](./DESIGN.md) (spec) และ [tasks/](./tasks/) (แผนงาน)
+Stack: Next.js 16 + Socket.IO · dev = process เดียว (`server.ts`, state ใน memory) · Vercel = route `/api/socket` + Upstash Redis · อ่านเพิ่ม: [DESIGN.md](./DESIGN.md) (spec) และ [tasks/](./tasks/) (แผนงาน)
 
 ## 1. สิ่งที่ต้องมี
 
@@ -93,8 +93,8 @@ cloudflared tunnel --url http://localhost:3000                 # quick tunnel: �
 
 ## 7. ข้อจำกัด
 
-- ห้อง เกม และ notification token อยู่ใน memory ของ `server.ts` → รันได้ **instance เดียว** ห้าม deploy ขึ้น Vercel หรือ serverless (แต่ละ instance ไม่เห็น memory ของกัน) ถ้าจะ host จริงใช้ Railway / Render / Fly แบบ 1 instance
-- server restart (รวมถึงตอน `npm run dev` restart เพราะแก้ไฟล์ฝั่ง server) = ห้องทั้งหมดหาย ผู้เล่นต้องสร้าง/เข้าห้องใหม่
+- ไม่ได้ตั้ง `REDIS_URL` (dev) → ห้อง เกม และ notification token อยู่ใน memory ของ `server.ts` → รันได้ **instance เดียว** และ server restart (รวมถึงตอน `npm run dev` restart เพราะแก้ไฟล์ฝั่ง server) = ห้องทั้งหมดหาย
+- Vercel: Socket.IO วิ่งผ่าน WebSocket ของ Vercel Functions (`src/app/api/socket/route.ts`) และ state อยู่ใน Upstash Redis (`REDIS_URL` จาก Marketplace) เพราะผู้เล่นห้องเดียวกันอาจต่อเข้าคนละ instance · WebSocket อย่างเดียว (ไม่มี long-polling) · connection ถูกตัดทุก ~280s (Hobby maxDuration 300s) แล้ว client ต่อใหม่เอง ผู้เล่นยังนับเป็น online ระหว่างนั้น (ผ่อนผัน 5s)
 - channel ยังไม่ verified → ใช้ได้เฉพาะ Developing channel และ Service Message ส่งได้เฉพาะผู้ใช้ที่เป็น Admin/Tester
 - Service Message ส่ง 1 ข้อความต่อคนต่อเกม (notification token 1 อันใช้ได้ 5 เกม)
 - ระบบเชิญเพื่อนแบบเต็ม (permanent link, shareTargetPicker, QR) ยังไม่ได้ทำ — มีแผนแยกที่ [tasks/2026-10-17-invite-friends/TASK.md](./tasks/2026-10-17-invite-friends/TASK.md)
@@ -102,14 +102,18 @@ cloudflared tunnel --url http://localhost:3000                 # quick tunnel: �
 ## โครงสร้างโปรเจกต์
 
 ```
-server.ts                  http server: Next handler + Socket.IO + /healthz (รันด้วย tsx)
-next.config.ts             allowedDevOrigins จาก ALLOWED_DEV_ORIGINS
+server.ts                  dev: http server: Next handler + Socket.IO + /healthz (รันด้วย tsx)
+next.config.ts             allowedDevOrigins จาก ALLOWED_DEV_ORIGINS, serverExternalPackages ของ Socket.IO
+vercel.json                region ของ function = sin1 (ที่เดียวกับ Upstash Redis)
+src/app/api/socket/route.ts  Vercel: รับ WebSocket upgrade แล้วส่งให้ engine.io
 src/shared/types.ts        contract ระหว่าง server/client: socket events, PublicRoomState, PrivateCard
 src/shared/locations.ts    รายชื่อสถานที่ + บทบาท
 src/server/auth.ts         Socket.IO middleware: verify LINE access token + ดึง profile (+ DEV_AUTH)
-src/server/rooms.ts        rooms ใน memory: create / join / leave / reconnect, toPublicState
-src/server/game.ts         สุ่ม spy และบทบาท, timer, โหวต, คำนวณผล
-src/server/handlers.ts     ผูก socket events เข้ากับ rooms/game และส่ง Service Message ตอนจบเกม
+src/server/kv.ts           ที่เก็บ state: Redis (REDIS_URL / KV_URL) หรือ memory + lock ต่อห้อง
+src/server/realtime.ts     ตั้งค่า Socket.IO ที่ใช้ร่วมกัน (Redis adapter, auth, ตัด connection ก่อน maxDuration)
+src/server/rooms.ts        rooms ใน kv: create / join / leave / reconnect / offline grace, toPublicState
+src/server/game.ts         สุ่ม spy และบทบาท, timer (endsAt), โหวต, คำนวณผล
+src/server/handlers.ts     ผูก socket events เข้ากับ rooms/game (withRoom: lock → แก้ → บันทึก → emit), timer ต่อ instance, Service Message
 src/server/line-notify.ts  Service Message: stateless token, notification token, buildResultParams
 src/lib/liff.ts            LIFF init/login หรือ dev mode (?devUser=), ลิงก์เชิญ
 src/lib/socket.ts          socket.io-client singleton + withAck

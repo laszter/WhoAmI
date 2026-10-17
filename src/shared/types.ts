@@ -49,6 +49,7 @@ export interface ClientToServerEvents {
   'vote:cast': (p: { targetId: string }, ack: (r: Ack) => void) => void;
   'spy:guess': (p: { location: string }, ack: (r: Ack) => void) => void; // P1
   'game:reset': (ack: (r: Ack) => void) => void;
+  'room:sync': (ack: (r: Ack) => void) => void; // นาฬิกาฝั่ง client เลย endsAt แล้วแต่ phase ยังไม่เปลี่ยน → ให้ server เช็กเวลาอีกรอบ
 }
 
 export interface ServerToClientEvents {
@@ -65,3 +66,6 @@ export const LIMITS = {
 } as const;
 export const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 export const ROOM_CODE_LENGTH = 4;
+
+// path ของ Socket.IO (WebSocket อย่างเดียว ไม่มี trailing slash) — dev: server.ts ดักก่อนถึง Next, Vercel: src/app/api/socket/route.ts
+export const SOCKET_PATH = '/api/socket';

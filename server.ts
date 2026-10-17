@@ -1,12 +1,11 @@
 // process เดียว: Next.js request handler + Socket.IO + /healthz
 // รันด้วย tsx (ไฟล์นี้ไม่ผ่าน Next compiler): dev = `tsx watch server.ts`, prod = `NODE_ENV=production tsx server.ts`
-// State ห้องอยู่ใน process นี้เท่านั้น → รันได้ instance เดียว
+// ไม่ตั้ง REDIS_URL → state ห้องอยู่ใน memory ของ process นี้ (รันได้ instance เดียว) · บน Vercel ไม่ใช้ไฟล์นี้ (ดู src/app/api/socket/route.ts)
 import { loadEnvConfig } from '@next/env';
 import { createServer } from 'node:http';
 import next from 'next';
 import { Server } from 'socket.io';
-import { authMiddleware } from './src/server/auth';
-import { registerHandlers } from './src/server/handlers';
+import { SOCKET_SERVER_OPTIONS, setupRealtime } from './src/server/realtime';
 import type { TypedServer } from './src/server/types';
 
 async function main() {
@@ -51,10 +50,9 @@ async function main() {
     });
   });
 
-  // destroyUpgrade: false → ไม่ให้ engine.io ปิด upgrade request ที่ไม่ใช่ /socket.io (เช่น HMR websocket ของ Next dev)
-  const io: TypedServer = new Server(httpServer, { path: '/socket.io', destroyUpgrade: false });
-  io.use(authMiddleware);
-  registerHandlers(io);
+  // destroyUpgrade: false → ไม่ให้ engine.io ปิด upgrade request ที่ไม่ใช่ SOCKET_PATH (เช่น HMR websocket ของ Next dev)
+  const io: TypedServer = new Server(httpServer, { ...SOCKET_SERVER_OPTIONS, destroyUpgrade: false });
+  setupRealtime(io);
 
   httpServer.listen(port, () => {
     console.log(`> Ready on http://localhost:${port} (dev=${dev}, DEV_AUTH=${process.env.DEV_AUTH ?? '0'})`);

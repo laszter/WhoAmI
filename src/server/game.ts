@@ -1,8 +1,9 @@
 // Game engine: phase transition + timer (server-authoritative) + vote resolution
 // ไม่ import socket.io — สื่อสารออกผ่าน EngineHooks เท่านั้น (handlers.ts เป็นคนต่อเข้ากับ io)
-// กฎ: ทุก transition ต้อง clearTimer ก่อนตั้งใหม่ และ callback ของ timer ต้องเช็ก phase/round ที่คาดไว้
+// timer = round.endsAt ใน state (ไม่มี setTimeout ในนี้): handlers.ts เรียก advanceDuePhase() ก่อนทุก operation
+// ของห้อง และตอน timer ของ instance ยิงที่ phaseDeadline() — ห้องอยู่ใน kv จึงเปลี่ยน phase จาก instance ไหนก็ได้
 import { randomInt } from 'node:crypto';
-import { LIMITS, type Ack, type Phase, type PrivateCard, type Winner } from '../shared/types';
+import { LIMITS, type Ack, type PrivateCard, type Winner } from '../shared/types';
 import { LOCATIONS, LOCATION_NAMES } from '../shared/locations';
 import type { Room, Round } from './types';
 
@@ -19,28 +20,20 @@ export function clampSec(value: unknown, max: number, fallback: number): number 
   return Math.min(max, Math.max(LIMITS.MIN_SEC, Math.round(n)));
 }
 
-export function clearTimer(room: Room): void {
-  if (room.timer) {
-    clearTimeout(room.timer);
-    room.timer = undefined;
-  }
+/** เวลาจบของ phase ที่มี timer (discussion / voting / spyGuess) — null = phase นี้ไม่มี timer */
+export function phaseDeadline(room: Room): number | null {
+  if (!room.round) return null;
+  if (room.phase !== 'discussion' && room.phase !== 'voting' && room.phase !== 'spyGuess') return null;
+  return room.round.endsAt;
 }
 
-/** ตั้ง timer ของ phase ปัจจุบัน — ยิงเฉพาะเมื่อ phase และ round ยังเป็นตัวเดิม (กัน timer เก่ายิงหลัง reset/เริ่มรอบใหม่) */
-function setPhaseTimer(room: Room, ms: number, expected: Phase, fire: () => void): void {
-  clearTimer(room);
-  const round = room.round;
-  const handle = setTimeout(() => {
-    if (room.timer === handle) room.timer = undefined;
-    if (room.phase !== expected || room.round !== round) return;
-    try {
-      fire();
-    } catch (err) {
-      // อยู่นอก socket handler → ถ้าไม่ catch จะทำให้ process ล่ม
-      console.error(`[game] timer error (room ${room.code}, phase ${expected})`, err);
-    }
-  }, Math.max(0, ms));
-  room.timer = handle;
+/** ถึง endsAt แล้ว → ทำสิ่งที่ timer ของ phase นั้นต้องทำ (idempotent: ยังไม่ถึงเวลา/ไม่มี timer = ไม่ทำอะไร) */
+export function advanceDuePhase(room: Room, hooks: EngineHooks, now = Date.now()): void {
+  const deadline = phaseDeadline(room);
+  if (deadline === null || now < deadline) return;
+  if (room.phase === 'discussion') openVote(room, hooks);
+  else if (room.phase === 'voting') finishVoting(room, hooks);
+  else if (room.phase === 'spyGuess') resolveSpyGuess(room, null, hooks); // หมดเวลาไม่ทาย → citizens ชนะ
 }
 
 function shuffle<T>(items: readonly T[]): T[] {
@@ -72,7 +65,6 @@ export function startRound(room: Room, opts: { discussionSec?: number; voteSec?:
     .filter((id) => id !== spyId)
     .forEach((id, i) => roles.set(id, roleDeck[i % roleDeck.length])); // บทบาทไม่พอ → วนซ้ำ
 
-  clearTimer(room);
   const round: Round = {
     location: location.name,
     spyId,
@@ -82,9 +74,6 @@ export function startRound(room: Room, opts: { discussionSec?: number; voteSec?:
   };
   room.round = round;
   room.phase = 'discussion';
-  setPhaseTimer(room, room.settings.discussionSec * 1000, 'discussion', () => {
-    openVote(room, hooks);
-  });
 
   hooks.broadcast(room);
   hooks.sendCards(room);
@@ -95,12 +84,8 @@ export function openVote(room: Room, hooks: EngineHooks): Ack {
   const round = room.round;
   if (room.phase !== 'discussion' || !round) return { ok: false, error: 'ยังไม่อยู่ในช่วงพูดคุย' };
 
-  clearTimer(room);
   room.phase = 'voting';
   round.endsAt = Date.now() + room.settings.voteSec * 1000;
-  setPhaseTimer(room, room.settings.voteSec * 1000, 'voting', () => {
-    finishVoting(room, hooks);
-  });
 
   hooks.broadcast(room);
   return { ok: true };
@@ -137,16 +122,12 @@ export function finishVoting(room: Room, hooks: EngineHooks): void {
   const round = room.round;
   if (room.phase !== 'voting' || !round) return;
 
-  clearTimer(room);
   const { accusedId, winner } = resolveVotes(round.votes, round.spyId);
   round.accusedId = accusedId;
 
   if (accusedId !== null && accusedId === round.spyId) {
     room.phase = 'spyGuess';
     round.endsAt = Date.now() + LIMITS.SPY_GUESS_SEC * 1000;
-    setPhaseTimer(room, LIMITS.SPY_GUESS_SEC * 1000, 'spyGuess', () => {
-      resolveSpyGuess(room, null, hooks); // หมดเวลาไม่ทาย → citizens ชนะ
-    });
     hooks.broadcast(room);
     return;
   }
@@ -172,7 +153,6 @@ function resolveSpyGuess(room: Room, guess: string | null, hooks: EngineHooks): 
   const round = room.round;
   if (room.phase !== 'spyGuess' || !round) return;
 
-  clearTimer(room);
   const accusedId = round.accusedId ?? null;
   if (guess === null) {
     round.result = { accusedId, winner: 'citizens' };
@@ -188,7 +168,6 @@ function resolveSpyGuess(room: Room, guess: string | null, hooks: EngineHooks): 
 /** result (หรือ discussion/voting/spyGuess เมื่อ host ยกเลิกเกม) → lobby */
 export function resetRoom(room: Room, hooks: EngineHooks): Ack {
   if (room.phase === 'lobby') return { ok: true }; // อยู่ lobby อยู่แล้ว (idempotent)
-  clearTimer(room);
   room.phase = 'lobby';
   room.round = undefined;
   hooks.broadcast(room);

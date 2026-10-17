@@ -19,6 +19,8 @@ import {
 
 type Fail = { ok: false; error: string };
 const NOT_CONNECTED: Fail = { ok: false, error: 'ยังไม่ได้เชื่อมต่อ server' };
+const SYNC_AFTER_MS = 1500; // เลย endsAt ไปเท่านี้แล้ว phase ยังไม่เปลี่ยน → room:sync
+const SYNC_RETRY_MS = 3000;
 
 // จำห้องล่าสุดต่อ userId (ปิด tab แล้วเปิดใหม่ → กลับห้องเดิม) — key แยกตาม user เพราะ dev mode หลาย tab ใช้ origin เดียวกัน
 const savedRoomKey = (userId: string) => `spy-party:room:${userId}`;
@@ -273,6 +275,20 @@ export function useGame(): GameClient {
     if (endsAt == null) return;
     const id = setInterval(() => setNow(Date.now() + offsetRef.current), 250);
     return () => clearInterval(id);
+  }, [endsAt]);
+
+  // หมดเวลาแล้วแต่ยังไม่ได้ room:state ของ phase ถัดไป → ขอให้ server เช็กเวลาอีกรอบ (ซ้ำจนกว่า endsAt จะเปลี่ยน)
+  // บน Vercel ห้องอยู่ใน Redis และ timer อยู่ใน function instance ที่แก้ห้องล่าสุด ซึ่งอาจถูกปิดไปแล้ว
+  useEffect(() => {
+    if (endsAt == null) return;
+    let id: ReturnType<typeof setTimeout>;
+    const sync = () => {
+      const s = getSocket();
+      if (s?.connected) s.emit('room:sync', () => undefined);
+      id = setTimeout(sync, SYNC_RETRY_MS);
+    };
+    id = setTimeout(sync, Math.max(0, endsAt - (Date.now() + offsetRef.current)) + SYNC_AFTER_MS);
+    return () => clearTimeout(id);
   }, [endsAt]);
 
   // sync ?room= ใน URL: อยู่ในห้อง → ?room=CODE (reload = reconnect, ปุ่ม share บน header ของ MINI App แชร์ห้องนี้)

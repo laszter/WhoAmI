@@ -30,6 +30,7 @@ import {
   LIMITS,
   ROOM_CODE_ALPHABET,
   ROOM_CODE_LENGTH,
+  SOCKET_PATH,
   type Ack,
   type ClientToServerEvents,
   type Me,
@@ -79,6 +80,8 @@ const openSockets = new Set<GameSocket>();
 async function connect(url: string, devUser: string, timeoutMs = WAIT_MS): Promise<Client> {
   const socket: GameSocket = io(url, {
     auth: { devUser },
+    path: SOCKET_PATH,
+    addTrailingSlash: false,
     transports: ['websocket'],
     reconnection: false, // หลุดแล้วไม่ต่อเอง: reconnect ทำเองใน scenario และไม่ค้างถ้า server ตาย
     forceNew: true,      // 1 user = 1 connection แยกกัน

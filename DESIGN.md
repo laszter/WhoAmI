@@ -64,6 +64,11 @@
 จึงต้องรันแค่ **instance เดียว** — อย่า deploy ขึ้น serverless เพราะแต่ละ instance ไม่เห็น memory ของกัน
 สำหรับ demo ให้รัน local + tunnel ถ้าจะ host จริงให้ใช้ Railway / Render / Fly แบบ 1 instance
 
+**Deploy บน Vercel (เพิ่มภายหลัง):** ไม่ใช้ `server.ts` — `src/app/api/socket/route.ts` รับ WebSocket upgrade จาก Vercel runtime
+แล้วส่งให้ engine.io · state ห้อง / ห้องปัจจุบันของ user / notification token ย้ายไป Upstash Redis (`src/server/kv.ts`) และใช้
+Socket.IO Redis adapter ส่ง event ข้าม instance · timer ของ phase เก็บเป็น `endsAt` แล้วแต่ละ instance ตั้ง timer เอง
+(+ client ส่ง `room:sync` เมื่อเลยเวลา) · dev ที่ไม่ได้ตั้ง `REDIS_URL` ยังเป็น memory ใน process เดียวเหมือนเดิม
+
 ## 4. Authentication
 
 1. Client: `await liff.init({ liffId })` → ถ้า `!liff.isLoggedIn()` ให้เรียก `liff.login()` (ใน LINE app จะ login อัตโนมัติ)

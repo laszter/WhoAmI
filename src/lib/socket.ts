@@ -1,6 +1,6 @@
 // Socket.IO client singleton (T4) — สร้างได้เฉพาะฝั่ง browser (io() ไม่ใส่ URL = ต่อ origin ปัจจุบัน)
 import { io, type Socket } from 'socket.io-client';
-import type { Ack, ClientToServerEvents, ServerToClientEvents } from '@/shared/types';
+import { SOCKET_PATH, type Ack, type ClientToServerEvents, type ServerToClientEvents } from '@/shared/types';
 
 export type GameSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
 
@@ -19,7 +19,9 @@ export function connectSocket(auth: { accessToken?: string; devUser?: string }):
     socket = null;
   }
   const s: GameSocket = io({
-    path: '/socket.io',
+    path: SOCKET_PATH,
+    addTrailingSlash: false, // /api/socket/ → Next redirect ซึ่ง WebSocket ตามไม่ได้
+    transports: ['websocket'], // server รับ WebSocket อย่างเดียว (Vercel ไม่มี sticky session ให้ long-polling)
     auth,
     reconnection: true,
     reconnectionDelayMax: 3000,
