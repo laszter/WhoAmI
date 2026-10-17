@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+/* ตัวแปร --font-noto-thai / --font-chakra มาจาก next/font ใน layout.tsx */
+@theme inline {
+  --font-sans: var(--font-noto-thai), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-chakra), var(--font-noto-thai), ui-sans-serif, sans-serif;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ไฟส่องจากด้านบน แบบห้องสอบสวน (สีพื้นมาจาก bg-slate-950 ที่ body) */
+body {
+  background-image: radial-gradient(ellipse 120% 55% at 50% -12%, rgb(99 102 241 / 0.16), transparent 62%);
+  background-repeat: no-repeat;
+}
+
+/* ลายเส้นทแยงบนหน้าปกแฟ้มลับ (RoleCard) */
+@utility bg-hatch {
+  background-image: repeating-linear-gradient(
+    135deg,
+    rgb(148 163 184 / 0.07) 0 2px,
+    transparent 2px 12px
+  );
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
