@@ -39,7 +39,7 @@ body { background: #262b44 url(/assets/misc/bg_tile@4x.png) repeat; }
 | ไฟล์ | ขนาด | ใช้ที่ |
 |---|---|---|
 | `misc/logo` | 48×36 | หน้า HOME |
-| `misc/app_icon`, `misc/app_icon_512.png` | 32×32 → 512 | ไอคอน LINE MINI App (ทึบทั้งภาพ) |
+| `misc/app_icon`, `misc/app_icon_1040.png` | 52×52 → 1040 | ไอคอน LINE MINI App: พื้นทึบ, โลโก้ 30px กลางภาพ = 75px บนพื้น 130px ตามสเปก LINE (54–76px) — อัปโหลด `app_icon_1040.png` ที่ Console → Basic settings → Channel icon |
 | `misc/bg_tile` | 32×32 | พื้นหลัง repeat |
 | `characters/char_spy` | 32×32 × 4 เฟรม | mascot หน้า HOME / การ์ดของ Spy |
 | `characters/avatar_player[_red/_green/_yellow/_purple/_orange/_pink/_gray]` | 16×16 | avatar สำรองเมื่อไม่มี `pictureUrl` |

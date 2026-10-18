@@ -71,9 +71,9 @@ export_all() {
   [[ ${#files[@]} -gt 0 ]] || { echo "ไม่มีไฟล์ใน $SRC ที่ตรงกับ '$ONLY'" >&2; exit 1; }
   for f in "${files[@]}"; do export_one "$f"; done
 
-  # LINE MINI App icon ต้องเป็นสี่เหลี่ยมจัตุรัสทึบ 512×512
+  # LINE MINI App icon: สี่เหลี่ยมจัตุรัสทึบ canvas 52px (= 130/2.5) → 1040×1040 สำหรับอัปโหลดใน LINE Developers Console
   if [[ -f "$SRC/app_icon.aseprite" ]]; then
-    ase "$SRC/app_icon.aseprite" --scale 16 --save-as "$OUT/misc/app_icon_512.png"
+    ase "$SRC/app_icon.aseprite" --scale 20 --save-as "$OUT/misc/app_icon_1040.png"
   fi
 
   # contact sheet ต่อหมวด ไว้รีวิวรวดเดียว (ไม่ได้ใช้ในแอพ)
